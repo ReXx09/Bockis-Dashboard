@@ -336,7 +336,7 @@ let toolToggleApiAvailable = true;
 let toolStateRefreshInFlight = false;
 const REFRESH_INTERVALS = {
   overviewMetricsMs: 4000,
-  audioMs: 7000,
+  audioMs: 12000,
   toolsStateMs: 5000,
   gitMs: 30000,
 };

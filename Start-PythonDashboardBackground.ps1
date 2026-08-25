@@ -69,7 +69,7 @@ function Get-PythonRunner {
 
     $py = Get-Command py -ErrorAction SilentlyContinue
     if ($py) {
-        foreach ($versionArg in @('-3.14', '-3.13', '-3.12', '-3.11', '-3.10', '-3')) {
+        foreach ($versionArg in @('-3.13', '-3.12')) {
             $candidates += @{ Cmd = 'py'; Prefix = @($versionArg) }
         }
     }
@@ -113,7 +113,7 @@ function Get-PythonRunner {
 
             $major = [int]$matches[1]
             $minor = [int]$matches[2]
-            if ($major -lt 3 -or ($major -eq 3 -and $minor -lt 10)) {
+            if ($major -ne 3 -or ($minor -ne 12 -and $minor -ne 13)) {
                 continue
             }
 
@@ -140,13 +140,14 @@ $checkArgs = @($runner.Prefix + @('-c', 'import fastapi, uvicorn, psutil, comtyp
 & $runner.Cmd @checkArgs 2>$null 1>$null
 if ($LASTEXITCODE -ne 0) {
     $reqPath = Join-Path $scriptDir 'requirements.txt'
-    if (Test-Path $reqPath) {
-        $installArgs = @($runner.Prefix + @('-m', 'pip', 'install', '-r', $reqPath))
-        & $runner.Cmd @installArgs 2>>$stderrLog 1>>$stdoutLog
-        if ($LASTEXITCODE -ne 0) {
-            exit 1
-        }
-    }
+    $msg = @(
+        "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Dashboard-Start abgebrochen: Python-Abhaengigkeiten fehlen.",
+        "Interpreter: $($runner.Cmd) $($runner.Prefix -join ' ')",
+        "Bitte manuell installieren:",
+        "  `"$($runner.Cmd)`" $($runner.Prefix -join ' ') -m pip install -r `"$reqPath`""
+    ) -join [Environment]::NewLine
+    $msg | Out-File -FilePath $stderrLog -Append -Encoding utf8
+    exit 1
 }
 
 $uvicornArgs = @($runner.Prefix + @('-m', 'uvicorn', 'app:app', '--host', '127.0.0.1', '--port', '9500'))
