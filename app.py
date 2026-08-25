@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import os
 import platform
 import re
@@ -151,6 +152,15 @@ _tool_state_ttl_sec = 1.2
 # Fallback hint for default input device if backend cannot read active microphone reliably.
 _audio_default_hint: dict[str, str | None] = {"input_id": None, "input_name": None}
 
+# Cache read-heavy audio endpoints to reduce COM/pycaw churn under UI polling.
+_audio_devices_cache: dict[str, object] = {"ts": 0.0, "payload": None}
+_audio_devices_cache_lock = threading.Lock()
+_audio_devices_cache_ttl_sec = 2.5
+
+_audio_sessions_cache: dict[str, object] = {"ts": 0.0, "payload": None}
+_audio_sessions_cache_lock = threading.Lock()
+_audio_sessions_cache_ttl_sec = 2.0
+
 # Serialize all mutating audio operations to avoid race conditions on rapid UI actions.
 _audio_write_lock = threading.Lock()
 _audio_write_timeout_sec = 8.0
@@ -165,6 +175,36 @@ _audio_diag_stats: dict[str, object] = {
     "last_duration_ms": 0,
 }
 _audio_last_error: dict[str, object] = {"ts": 0.0, "action": "", "message": ""}
+
+# Protect read-heavy audio endpoints from repeated failures by applying a short cooldown.
+_audio_read_circuit_lock = threading.Lock()
+_audio_read_circuit_state: dict[str, object] = {
+    "consecutive_failures": 0,
+    "total_failures": 0,
+    "opened_until": 0.0,
+    "last_action": "",
+    "last_message": "",
+}
+_audio_read_failure_threshold = 3
+_audio_read_cooldown_sec = 30.0
+
+
+def _cache_get(cache: dict[str, object], lock: threading.Lock, ttl_sec: float):
+    now = current_time()
+    with lock:
+        ts = float(cache.get("ts") or 0.0)
+        payload = cache.get("payload")
+        if payload is None:
+            return None
+        if now - ts > max(0.1, float(ttl_sec)):
+            return None
+        return copy.deepcopy(payload)
+
+
+def _cache_set(cache: dict[str, object], lock: threading.Lock, payload: object) -> None:
+    with lock:
+        cache["ts"] = current_time()
+        cache["payload"] = copy.deepcopy(payload)
 
 _POLICY_CONFIG_ACTIVATION_CLASS = "Windows.Media.Internal.AudioPolicyConfig"
 _POLICY_CONFIG_FACTORY_IIDS = (
@@ -538,6 +578,78 @@ def _get_audio_diag_snapshot() -> dict:
         "recent_events": events[-20:],
         "queue_timeout_sec": _audio_write_timeout_sec,
     }
+
+
+def _get_audio_read_circuit_snapshot() -> dict:
+    now = current_time()
+    with _audio_read_circuit_lock:
+        state = dict(_audio_read_circuit_state)
+
+    opened_until = float(state.get("opened_until") or 0.0)
+    is_open = opened_until > now
+    return {
+        "open": is_open,
+        "cooldown_remaining_sec": max(0.0, round(opened_until - now, 3)),
+        "consecutive_failures": int(state.get("consecutive_failures") or 0),
+        "total_failures": int(state.get("total_failures") or 0),
+        "last_action": str(state.get("last_action") or ""),
+        "last_message": str(state.get("last_message") or ""),
+        "failure_threshold": int(_audio_read_failure_threshold),
+        "cooldown_sec": float(_audio_read_cooldown_sec),
+    }
+
+
+def _audio_read_circuit_is_open() -> tuple[bool, float]:
+    now = current_time()
+    with _audio_read_circuit_lock:
+        opened_until = float(_audio_read_circuit_state.get("opened_until") or 0.0)
+    if opened_until > now:
+        return True, max(0.0, opened_until - now)
+    return False, 0.0
+
+
+def _audio_read_circuit_mark_success() -> None:
+    with _audio_read_circuit_lock:
+        _audio_read_circuit_state["consecutive_failures"] = 0
+
+
+def _audio_read_circuit_mark_failure(action: str, message: str) -> None:
+    now = current_time()
+    with _audio_read_circuit_lock:
+        current_failures = int(_audio_read_circuit_state.get("consecutive_failures") or 0) + 1
+        _audio_read_circuit_state["consecutive_failures"] = current_failures
+        _audio_read_circuit_state["total_failures"] = int(_audio_read_circuit_state.get("total_failures") or 0) + 1
+        _audio_read_circuit_state["last_action"] = str(action or "")
+        _audio_read_circuit_state["last_message"] = str(message or "")
+        if current_failures >= _audio_read_failure_threshold:
+            _audio_read_circuit_state["opened_until"] = now + _audio_read_cooldown_sec
+
+
+def _run_audio_read_action(action: str, fn, fallback: dict) -> dict:
+    is_open, remaining = _audio_read_circuit_is_open()
+    if is_open:
+        payload = dict(fallback or {})
+        payload.setdefault("available", False)
+        payload["message"] = f"Audio endpoint temporarily throttled ({remaining:.1f}s cooldown)."
+        payload["circuit_open"] = True
+        payload["circuit_cooldown_remaining_sec"] = round(remaining, 3)
+        return payload
+
+    try:
+        result = fn()
+        payload = dict(result if isinstance(result, dict) else {})
+        payload.setdefault("circuit_open", False)
+        _audio_read_circuit_mark_success()
+        return payload
+    except Exception as ex:
+        message = f"{type(ex).__name__}: {ex}"
+        _audio_read_circuit_mark_failure(action, message)
+        payload = dict(fallback or {})
+        payload.setdefault("available", False)
+        payload["message"] = message
+        payload["circuit_open"] = True
+        payload["circuit"] = _get_audio_read_circuit_snapshot()
+        return payload
 
 
 def _run_powershell(command: str, timeout: int = 8) -> tuple[int, str]:
@@ -1743,8 +1855,14 @@ def get_audio_status() -> dict:
 
 
 def get_audio_devices() -> dict:
+    cached = _cache_get(_audio_devices_cache, _audio_devices_cache_lock, _audio_devices_cache_ttl_sec)
+    if cached is not None:
+        return cached
+
     if not _ensure_audio_backend():
-        return {"available": False, "active_output": None, "active_input": None, "devices": []}
+        payload = {"available": False, "active_output": None, "active_input": None, "devices": []}
+        _cache_set(_audio_devices_cache, _audio_devices_cache_lock, payload)
+        return payload
 
     devices: list[dict] = []
     dedup_by_name: dict[str, dict] = {}
@@ -1848,7 +1966,9 @@ def get_audio_devices() -> dict:
         )
     )
 
-    return {"available": True, "active_output": active_output, "active_input": active_input, "devices": devices}
+    payload = {"available": True, "active_output": active_output, "active_input": active_input, "devices": devices}
+    _cache_set(_audio_devices_cache, _audio_devices_cache_lock, payload)
+    return payload
 
 
 def _ps_quote(value: str) -> str:
@@ -1971,8 +2091,14 @@ def _iter_audio_sessions_with_devices() -> list[tuple[object, str, str]]:
 
 
 def get_audio_sessions() -> dict:
+    cached = _cache_get(_audio_sessions_cache, _audio_sessions_cache_lock, _audio_sessions_cache_ttl_sec)
+    if cached is not None:
+        return cached
+
     if not _ensure_audio_backend():
-        return {"available": False, "sessions": []}
+        payload = {"available": False, "sessions": []}
+        _cache_set(_audio_sessions_cache, _audio_sessions_cache_lock, payload)
+        return payload
 
     result: list[dict] = []
     with _audio_com_context():
@@ -2000,7 +2126,9 @@ def get_audio_sessions() -> dict:
                 continue
 
     result = sorted(result, key=lambda x: (x["app"].lower(), x["device_name"].lower(), x["pid"]))
-    return {"available": True, "sessions": result}
+    payload = {"available": True, "sessions": result}
+    _cache_set(_audio_sessions_cache, _audio_sessions_cache_lock, payload)
+    return payload
 
 
 def set_audio_session_volume(pid: int, level: int) -> bool:
@@ -2126,6 +2254,7 @@ def index() -> FileResponse:
 @app.get("/api/health")
 def health() -> dict:
     audio_diag = _get_audio_diag_snapshot()
+    audio_read_circuit = _get_audio_read_circuit_snapshot()
     return {
         "ok": True,
         "service": "python-dashboard",
@@ -2134,6 +2263,7 @@ def health() -> dict:
             "write_lock_busy": _audio_write_lock.locked(),
             "stats": audio_diag.get("stats", {}),
             "last_error": audio_diag.get("last_error", {}),
+            "read_circuit": audio_read_circuit,
         },
     }
 
@@ -2193,7 +2323,11 @@ def api_processes(top: int = 10) -> list[dict]:
 
 @app.get("/api/audio")
 def api_audio() -> dict:
-    return get_audio_status()
+    return _run_audio_read_action(
+        "audio_status",
+        get_audio_status,
+        {"available": False, "level": 0, "muted": False},
+    )
 
 
 @app.post("/api/audio/volume/{level}")
@@ -2228,7 +2362,11 @@ def api_audio_open_routing_settings() -> dict:
 
 @app.get("/api/audio/devices")
 def api_audio_devices() -> dict:
-    devices = get_audio_devices()
+    devices = _run_audio_read_action(
+        "audio_devices",
+        get_audio_devices,
+        {"available": False, "active_output": None, "active_input": None, "devices": []},
+    )
     devices["routing_supported"] = True
     devices["routing_message"] = "Globales Ausgabegeraet kann direkt umgeschaltet werden. App-spezifisch weiterhin ueber Windows-Routing."
     return devices
@@ -2316,7 +2454,11 @@ def api_audio_route_app_read(pid: int, device_kind: str = "output") -> dict:
         kind = "output"
 
     ok, persisted_id, message = get_persisted_app_audio_endpoint(pid, kind)
-    devices_data = get_audio_devices()
+    devices_data = _run_audio_read_action(
+        "audio_devices_for_route_read",
+        get_audio_devices,
+        {"available": False, "active_output": None, "active_input": None, "devices": []},
+    )
     devices = devices_data.get("devices") or []
     mapped = next((x for x in devices if str(x.get("id") or "") == str(persisted_id or "")), None)
     persisted_name = str((mapped or {}).get("name") or "")
@@ -2351,7 +2493,11 @@ def api_audio_route_app_readback(payload: dict | None = None) -> dict:
                 continue
     pids = sorted(set(pids))[:300]
 
-    devices_data = get_audio_devices()
+    devices_data = _run_audio_read_action(
+        "audio_devices_for_route_readback",
+        get_audio_devices,
+        {"available": False, "active_output": None, "active_input": None, "devices": []},
+    )
     device_map = {str(d.get("id") or ""): str(d.get("name") or "") for d in (devices_data.get("devices") or [])}
 
     routes: list[dict] = []
@@ -2387,18 +2533,31 @@ def api_audio_route_app_clear_all() -> dict:
 
 @app.get("/api/audio/sessions")
 def api_audio_sessions() -> dict:
-    return get_audio_sessions()
+    return _run_audio_read_action(
+        "audio_sessions",
+        get_audio_sessions,
+        {"available": False, "sessions": []},
+    )
 
 
 @app.get("/api/audio/input-level")
 def api_audio_input_level() -> dict:
-    return get_input_metering_level()
+    return _run_audio_read_action(
+        "audio_input_level",
+        get_input_metering_level,
+        {"available": False, "level": 0},
+    )
 
 
 @app.get("/api/audio/health")
 def api_audio_health() -> dict:
-    status = get_audio_status()
+    status = _run_audio_read_action(
+        "audio_health_status",
+        get_audio_status,
+        {"available": False, "level": 0, "muted": False},
+    )
     diag = _get_audio_diag_snapshot()
+    read_circuit = _get_audio_read_circuit_snapshot()
     return {
         "ok": True,
         "audio_available": bool(status.get("available")),
@@ -2407,6 +2566,7 @@ def api_audio_health() -> dict:
         "queue_timeout_sec": diag.get("queue_timeout_sec", _audio_write_timeout_sec),
         "stats": diag.get("stats", {}),
         "last_error": diag.get("last_error", {}),
+        "read_circuit": read_circuit,
     }
 
 
@@ -2417,10 +2577,11 @@ def api_debug_audio() -> dict:
 
 @app.get("/api/audio/open-programs")
 def api_audio_open_programs(limit: int = 300) -> dict:
-    try:
-        return {"available": True, "programs": get_open_programs(limit)}
-    except Exception as ex:
-        return {"available": False, "programs": [], "message": str(ex)}
+    return _run_audio_read_action(
+        "audio_open_programs",
+        lambda: {"available": True, "programs": get_open_programs(limit)},
+        {"available": False, "programs": []},
+    )
 
 
 @app.post("/api/audio/session/{pid}/volume/{level}")
