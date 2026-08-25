@@ -23,6 +23,7 @@
   --glass-blur-strong: 8px;
   --glass-blur-soft: 6px;
   --layout-columns: 24;
+  --layout-columns-user: 24;
 }
 
 * { box-sizing: border-box; }
