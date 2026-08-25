@@ -343,6 +343,14 @@ const REFRESH_INTERVALS = {
 const masonryFrames = new Map();
 let layoutResizeObserver = null;
 let layoutResizeDebounce = null;
+// Responsive breakpoints for dynamic column count (container-width → logical columns).
+// The user's saved preference acts as the upper cap; below each threshold the grid
+// automatically collapses to fewer columns regardless of what the buttons say.
+const RESPONSIVE_COLUMN_BREAKPOINTS = [
+  { maxWidth: 420, cols: 1 },
+  { maxWidth: 680, cols: 2 },
+  { maxWidth: 1020, cols: 3 },
+];
 const HISTORY_LEN = 45;
 const monitorHistory = {
   cpu: [],
@@ -549,6 +557,12 @@ function applyResponsiveCardSpan(card, layoutEl = dashboardGrid, size = null) {
 }
 
 function applyResponsiveTileSpans(layoutEl = dashboardGrid) {
+  if (!layoutEl) return;
+  // Compute the responsive track count and write it as an inline style so that
+  // (a) the CSS grid-template-columns reflows automatically, and
+  // (b) getLayoutColumnCount() returns the correct value for span calculations below.
+  const tracks = getResponsiveColumnCount(layoutEl);
+  layoutEl.style.setProperty('--layout-columns', String(tracks));
   getCards(layoutEl).forEach((card) => {
     applyResponsiveCardSpan(card, layoutEl);
   });
@@ -624,7 +638,33 @@ function saveDashboardColumns(columns) {
 
 function applyDashboardColumns(page, columns) {
   const safeColumns = Math.max(2, Math.min(4, Number.parseInt(columns, 10) || 3));
-  document.documentElement.style.setProperty('--layout-columns', Math.round(safeColumns * 6));
+  const tracks = Math.round(safeColumns * 6);
+  // Keep :root in sync as CSS fallback and as the user-preference source for responsive clamping.
+  document.documentElement.style.setProperty('--layout-columns', tracks);
+  document.documentElement.style.setProperty('--layout-columns-user', tracks);
+}
+
+function getResponsiveColumnCount(layoutEl) {
+  // Read the user's stored preference from the CSS variable set by applyDashboardColumns.
+  const rawUser = getComputedStyle(document.documentElement).getPropertyValue('--layout-columns-user').trim();
+  const userTracks = Number.parseInt(rawUser, 10) || 24;
+  const userCols = Math.round(userTracks / 6); // e.g. 24 → 4, 18 → 3, 12 → 2
+
+  // If the element is not rendered (hidden page) fall back to the user preference.
+  const containerWidth = layoutEl ? (layoutEl.offsetWidth || 0) : 0;
+  if (!containerWidth) return userTracks;
+
+  // Find the smallest breakpoint that the container width exceeds.
+  let responsiveCols = userCols;
+  for (const bp of RESPONSIVE_COLUMN_BREAKPOINTS) {
+    if (containerWidth <= bp.maxWidth) {
+      responsiveCols = bp.cols;
+      break;
+    }
+  }
+
+  // Effective columns = min(what user wants, what fits in the container).
+  return Math.max(1, Math.min(userCols, responsiveCols)) * 6;
 }
 
 function getCurrentDashboardColumns(page = getCurrentPage()) {
